@@ -1,0 +1,22 @@
+services:
+  eth-sentry:
+    build: src
+    container_name: eth-sentry
+    restart: unless-stopped
+    environment:
+      - BEACON_NODE_URL=${BN_URL:-http://localhost:5052}
+      - EXECUTION_NODE_URL=${EC_URL:-http://localhost:8545}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - VALIDATOR_INDICES=${VALIDATOR_INDICES}
+      - CHECK_INTERVAL=5
+# Uncomment relevant network(s) when using hyperdrive/rocketpool :
+#    networks:
+#      - hyperdrive_net
+#      - rocketpool_net
+#
+#networks:
+#  hyperdrive_net:
+#    external: true
+#  rocketpool_net:
+#    external: true
