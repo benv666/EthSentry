@@ -74,6 +74,8 @@ hyperdrive sw v s | grep -o "Index [0-9]\+" | awk '{print $2;}' | paste -sd,
 |----------------------------|-------------------------|-----------------------------------------------|
 | `BEACON_NODE_URL`          | `http://localhost:5052` | Beacon node API endpoint                      |
 | `EXECUTION_NODE_URL`       | `http://localhost:8545` | Execution client RPC endpoint                 |
+| `FALLBACK_BEACON_NODE_URL` | *None*                  | Fallback beacon node API endpoint             |
+| `FALLBACK_EXECUTION_NODE_URL` | *None*                  | Fallback execution node API endpoint             |
 | `VALIDATOR_INDICES`        | *None*                  | Comma-separated validator indices             |
 | `CHECK_INTERVAL`           | `5`                     | Minutes between checks                        |
 | `PROPOSAL_LOOKAHEAD`       | `2`                     | Epochs to look ahead for proposals            |
