@@ -11,14 +11,28 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - VALIDATOR_INDICES=${VALIDATOR_INDICES}
-      - CHECK_INTERVAL=5
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-5}
+      - SLOT_CHECK_INTERVAL=${SLOT_CHECK_INTERVAL:-12}
+      - PROPOSAL_LOOKAHEAD=${PROPOSAL_LOOKAHEAD:-1}
+      - SYNC_COMMITTEE_LOOKAHEAD=${SYNC_COMMITTEE_LOOKAHEAD:-1}
+      - SHOUTRRR_URLS=${SHOUTRRR_URLS}
+      - ENABLE_PROMETHEUS=${ENABLE_PROMETHEUS:-false}
+      - PROMETHEUS_PORT=${PROMETHEUS_PORT:-8080}
+      - EPOCH_SUMMARY_ENABLED=${EPOCH_SUMMARY_ENABLED:-true}
+#    # Uncomment to expose Prometheus metrics
+#    ports:
+#      - "8080:8080"
 # Uncomment relevant network(s) when using hyperdrive/rocketpool :
 #    networks:
 #      - hyperdrive_net
 #      - rocketpool_net
+#      # If your prometheus setup needs it
+#      - prometheus
 #
 #networks:
 #  hyperdrive_net:
 #    external: true
 #  rocketpool_net:
+#    external: true
+#  prometheus:
 #    external: true
