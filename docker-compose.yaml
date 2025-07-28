@@ -1,6 +1,6 @@
 services:
   eth-sentry:
-    build: src
+    build: .
     container_name: eth-sentry
     restart: unless-stopped
     environment:

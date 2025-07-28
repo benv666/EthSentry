@@ -1,0 +1,644 @@
+// internal/monitor/monitor.go - Main monitoring logic
+package monitor
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
+	"time"
+
+	"eth-sentry/internal/attestation"
+	"eth-sentry/internal/beacon"
+	"eth-sentry/internal/config"
+	"eth-sentry/internal/notifications"
+	"eth-sentry/internal/prometheus"
+	"eth-sentry/internal/types"
+)
+
+type Monitor struct {
+	config             *config.Config
+	beaconClient       *beacon.Client
+	attestationChecker *attestation.Checker
+	validatorManager   *ValidatorManager
+	notifier           *notifications.Notifier
+	metrics            *prometheus.Metrics
+	logger             *slog.Logger
+	lastProcessedSlot  int
+	lastProcessedEpoch int
+}
+
+func New(cfg *config.Config, notifier *notifications.Notifier, logger *slog.Logger) *Monitor {
+	beaconClient := beacon.NewClient(logger)
+	attestationChecker := attestation.NewChecker(beaconClient, logger)
+	validatorManager := NewValidatorManager(cfg.ValidatorIndices, logger)
+	metrics := prometheus.New(cfg.EnablePrometheus, cfg.PrometheusPort)
+
+	return &Monitor{
+		config:             cfg,
+		beaconClient:       beaconClient,
+		attestationChecker: attestationChecker,
+		validatorManager:   validatorManager,
+		notifier:           notifier,
+		metrics:            metrics,
+		logger:             logger,
+	}
+}
+
+func (m *Monitor) Start(ctx context.Context) {
+	m.logger.Info("Starting Enhanced Ethereum Validator Monitor",
+		"slot_check_interval", m.config.SlotCheckInterval,
+		"full_check_interval", m.config.CheckInterval,
+		"validator_count", len(m.config.ValidatorIndices),
+		"prometheus_enabled", m.config.EnablePrometheus)
+
+	// Send startup notification
+	message := "🚀 <b>Enhanced Validator Monitor Started</b>\n\n" +
+		fmt.Sprintf("• Validators: %d\n", len(m.config.ValidatorIndices)) +
+		fmt.Sprintf("• Slot checks: every %ds\n", m.config.SlotCheckInterval) +
+		fmt.Sprintf("• Full checks: every %dm\n", m.config.CheckInterval) +
+		fmt.Sprintf("• Prometheus: %v\n", m.config.EnablePrometheus) +
+		"\n<i>Enhanced monitoring is now active!</i>"
+
+	m.notifier.Send(message, "startup")
+
+	// Start telegram command processor
+	m.notifier.StartTelegramCommandProcessor(m.handleTelegramCommand)
+
+	// Get initial state
+	if currentSlot, err := m.beaconClient.GetCurrentSlot(m.config.BeaconNodeURL); err == nil {
+		m.lastProcessedSlot = currentSlot - 1
+		m.lastProcessedEpoch = (currentSlot - 1) / 32
+	}
+
+	// Run initial full check
+	m.runFullCheck()
+
+	// Setup tickers
+	slotTicker := time.NewTicker(time.Duration(m.config.SlotCheckInterval) * time.Second)
+	fullTicker := time.NewTicker(time.Duration(m.config.CheckInterval) * time.Minute)
+	defer slotTicker.Stop()
+	defer fullTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			m.logger.Info("Shutting down validator monitor...")
+
+			exitMessage := "🛑 <b>Enhanced Validator Monitor Stopped</b>\n\n" +
+				"<i>Monitoring has been temporarily disabled. " +
+				"Please restart the service to resume monitoring.</i>"
+
+			m.notifier.Send(exitMessage, "shutdown")
+			return
+
+		case <-slotTicker.C:
+			m.runSlotCheck()
+
+		case <-fullTicker.C:
+			m.runFullCheck()
+		}
+	}
+}
+
+func (m *Monitor) runSlotCheck() {
+	currentSlot, err := m.beaconClient.GetCurrentSlot(m.config.BeaconNodeURL)
+	if err != nil {
+		m.logger.Error("Failed to get current slot", "error", err)
+		return
+	}
+
+	// Only process if we haven't seen this slot yet
+	if currentSlot <= m.lastProcessedSlot {
+		return
+	}
+
+	m.logger.Debug("Processing new slot", "slot", currentSlot, "last_processed", m.lastProcessedSlot)
+
+	// Check for block proposals in recent slots
+	for slot := m.lastProcessedSlot + 1; slot <= currentSlot; slot++ {
+		if err := m.checkProposalPerformance(slot); err != nil {
+			m.logger.Debug("Error checking proposal performance", "slot", slot, "error", err)
+		}
+	}
+
+	m.lastProcessedSlot = currentSlot
+
+	// Check if we entered a new epoch
+	currentEpoch := currentSlot / 32
+	if currentEpoch > m.lastProcessedEpoch {
+		m.logger.Info("New epoch detected", "epoch", currentEpoch, "slot", currentSlot)
+
+		// Check attestation performance for the completed epoch
+		if m.lastProcessedEpoch > 0 {
+			if results, err := m.attestationChecker.CheckEpochAttestations(
+				m.config.BeaconNodeURL, m.lastProcessedEpoch, m.config.ValidatorIndices); err != nil {
+				m.logger.Error("Failed to check attestation performance", "epoch", m.lastProcessedEpoch, "error", err)
+			} else {
+				m.validatorManager.UpdateAttestationResults(results)
+
+				// Update metrics and send alerts
+				for _, result := range results {
+					m.metrics.UpdateAttestation(result.ValidatorIndex, result.Attested)
+
+					if !result.Attested {
+						alertKey := fmt.Sprintf("missed_attestation_%d_%d", result.ValidatorIndex, result.Epoch)
+						if m.validatorManager.ShouldSendAlert(alertKey, 60) {
+							message := fmt.Sprintf("⚠️ <b>Missed Attestation</b>\nValidator: %d\nEpoch: %d\nSlot: %d",
+								result.ValidatorIndex, result.Epoch, result.Slot)
+							m.notifier.Send(message, "missed_attestation")
+						}
+					}
+				}
+			}
+
+			// Send epoch summary
+			if m.config.EpochSummaryEnabled {
+				m.sendEpochSummary(m.lastProcessedEpoch)
+			}
+		}
+
+		m.lastProcessedEpoch = currentEpoch
+		m.metrics.UpdateCurrentEpoch(currentEpoch)
+	}
+}
+
+func (m *Monitor) runFullCheck() {
+	m.logger.Info("Starting full validator monitoring check")
+
+	// Check all nodes
+	nodes, err := m.checkAllNodes()
+	if err != nil {
+		m.logger.Error("Failed to check nodes", "error", err)
+		return
+	}
+
+	// Update metrics
+	m.metrics.UpdateNodeStatus(nodes)
+
+	// Check for node issues and send alerts
+	primaryBeaconOk := false
+	primaryExecutionOk := false
+
+	for _, node := range nodes {
+		if node.Error != nil {
+			alertKey := fmt.Sprintf("%s_error", strings.ToLower(strings.ReplaceAll(node.Name, " ", "_")))
+			if m.validatorManager.ShouldSendAlert(alertKey, 30) {
+				message := fmt.Sprintf("🚨 <b>%s Node Error</b>\nURL: %s\nError: %v",
+					node.Name, node.URL, node.Error)
+				m.notifier.Send(message, "node_error")
+			}
+		} else if !node.Synced {
+			alertKey := fmt.Sprintf("%s_syncing", strings.ToLower(strings.ReplaceAll(node.Name, " ", "_")))
+			if m.validatorManager.ShouldSendAlert(alertKey, 30) {
+				message := fmt.Sprintf("⚠️ <b>%s Node Syncing</b>\nURL: %s\nNode is not fully synced",
+					node.Name, node.URL)
+				m.notifier.Send(message, "node_syncing")
+			}
+		}
+
+		if node.Name == "Primary Beacon" && node.Error == nil && node.Synced {
+			primaryBeaconOk = true
+		}
+		if node.Name == "Primary Execution" && node.Error == nil && node.Synced {
+			primaryExecutionOk = true
+		}
+	}
+
+	if !primaryBeaconOk || !primaryExecutionOk {
+		m.logger.Warn("Primary nodes not ready, skipping validator checks")
+		return
+	}
+
+	// Get current epoch
+	currentSlot, err := m.beaconClient.GetCurrentSlot(m.config.BeaconNodeURL)
+	if err != nil {
+		m.logger.Error("Failed to get current epoch", "error", err)
+		return
+	}
+	currentEpoch := currentSlot / 32
+
+	// Check validator statuses
+	validators, err := m.beaconClient.GetValidatorStatuses(m.config.BeaconNodeURL, m.config.ValidatorIndices)
+	if err != nil {
+		m.logger.Error("Failed to get validator statuses", "error", err)
+		return
+	}
+
+	// Update validator states and check for changes
+	changes := m.validatorManager.UpdateValidatorStates(validators)
+	for _, change := range changes {
+		m.logger.Info("Validator state change", "change", change)
+		// Send notification for significant changes
+		if strings.Contains(change, "slashed") {
+			m.notifier.Send(fmt.Sprintf("🚨 <b>Validator Slashed!</b>\n%s", change), "validator_slashed")
+		}
+	}
+
+	// Update Prometheus metrics
+	activeCount := 0
+	for _, validator := range validators {
+		idx := validator.Index
+		balance, _ := strconv.ParseFloat(validator.Balance, 64)
+		active := validator.Status == "active_ongoing" && !validator.Validator.Slashed
+
+		m.metrics.UpdateValidatorStatus(idx, validator.Status, balance, active)
+
+		if active {
+			activeCount++
+		}
+	}
+
+	// Check upcoming duties
+	m.checkUpcomingProposals(currentEpoch)
+	m.checkSyncCommitteeParticipation(currentEpoch)
+
+	// Send periodic status summary
+	if m.validatorManager.ShouldSendAlert("status_summary", 360) { // Every 6 hours
+		message := fmt.Sprintf(
+			"✅ <b>Validator Status Summary</b>\n"+
+				"Epoch: %d\n"+
+				"Active Validators: %d/%d\n"+
+				"Nodes: All operational",
+			currentEpoch,
+			activeCount,
+			len(m.config.ValidatorIndices))
+		m.notifier.Send(message, "status_summary")
+	}
+
+	m.logger.Info("Full check completed",
+		"epoch", currentEpoch,
+		"active_validators", activeCount,
+		"total_validators", len(m.config.ValidatorIndices))
+}
+
+func (m *Monitor) checkProposalPerformance(slot int) error {
+	// Get block info for the slot
+	blockInfo, err := m.beaconClient.GetBlock(m.config.BeaconNodeURL, slot)
+	if err != nil {
+		// No block proposed at this slot
+		return nil
+	}
+
+	proposerIndex, err := strconv.Atoi(blockInfo.Data.Message.ProposerIndex)
+	if err != nil {
+		return err
+	}
+
+	// Check if this is one of our validators
+	states := m.validatorManager.GetStates()
+	if _, exists := states[proposerIndex]; !exists {
+		return nil // Not our validator
+	}
+
+	// Calculate reward (simplified - would need to get actual execution payload data)
+	gasUsed, _ := strconv.ParseInt(blockInfo.Data.Message.Body.ExecutionPayload.GasUsed, 0, 64)
+	// Simplified reward calculation - in practice you'd need to get tips and base fees
+	estimatedReward := gasUsed * 15 // gwei per gas (very rough estimate)
+
+	// Update validator state
+	m.validatorManager.UpdateProposal(proposerIndex, slot, estimatedReward)
+
+	// Send notification about successful proposal
+	epoch := slot / 32
+	message := fmt.Sprintf("🎯 <b>Block Proposed!</b>\n"+
+		"Validator: %d\n"+
+		"Slot: %d\n"+
+		"Epoch: %d\n"+
+		"Estimated Reward: %.6f ETH",
+		proposerIndex, slot, epoch, float64(estimatedReward)/1e9)
+
+	m.notifier.Send(message, "successful_proposal")
+
+	// Update Prometheus metrics
+	m.metrics.UpdateProposal(proposerIndex, slot, estimatedReward, true)
+
+	m.logger.Info("Successful block proposal detected",
+		"validator", proposerIndex,
+		"slot", slot,
+		"epoch", epoch,
+		"estimated_reward", estimatedReward)
+
+	return nil
+}
+
+func (m *Monitor) checkAllNodes() ([]types.NodeStatus, error) {
+	var nodes []types.NodeStatus
+
+	// Primary beacon node
+	beaconSynced, beaconErr := m.beaconClient.CheckBeaconNodeSync(m.config.BeaconNodeURL)
+	nodes = append(nodes, types.NodeStatus{
+		Name:   "Primary Beacon",
+		URL:    m.config.BeaconNodeURL,
+		Synced: beaconSynced,
+		Error:  beaconErr,
+	})
+
+	// Primary execution node
+	executionSynced, executionErr := m.beaconClient.CheckExecutionClientSync(m.config.ExecutionClientURL)
+	nodes = append(nodes, types.NodeStatus{
+		Name:   "Primary Execution",
+		URL:    m.config.ExecutionClientURL,
+		Synced: executionSynced,
+		Error:  executionErr,
+	})
+
+	// Fallback nodes
+	if m.config.FallbackBeaconNodeURL != "" {
+		fallbackBeaconSynced, fallbackBeaconErr := m.beaconClient.CheckBeaconNodeSync(m.config.FallbackBeaconNodeURL)
+		nodes = append(nodes, types.NodeStatus{
+			Name:   "Fallback Beacon",
+			URL:    m.config.FallbackBeaconNodeURL,
+			Synced: fallbackBeaconSynced,
+			Error:  fallbackBeaconErr,
+		})
+	}
+
+	if m.config.FallbackExecutionClientURL != "" {
+		fallbackExecutionSynced, fallbackExecutionErr := m.beaconClient.CheckExecutionClientSync(m.config.FallbackExecutionClientURL)
+		nodes = append(nodes, types.NodeStatus{
+			Name:   "Fallback Execution",
+			URL:    m.config.FallbackExecutionClientURL,
+			Synced: fallbackExecutionSynced,
+			Error:  fallbackExecutionErr,
+		})
+	}
+
+	return nodes, nil
+}
+
+func (m *Monitor) checkUpcomingProposals(currentEpoch int) error {
+	validatorIndexMap := make(map[string]bool)
+	for _, idx := range m.config.ValidatorIndices {
+		validatorIndexMap[strconv.Itoa(idx)] = true
+	}
+
+	for i := 0; i <= m.config.ProposalLookahead; i++ {
+		epoch := currentEpoch + i
+		duties, err := m.beaconClient.GetProposerDuties(m.config.BeaconNodeURL, epoch)
+		if err != nil {
+			m.logger.Warn("Failed to get proposer duties", "epoch", epoch, "error", err)
+			continue
+		}
+
+		for _, duty := range duties {
+			if validatorIndexMap[duty.ValidatorIndex] {
+				slot, _ := strconv.Atoi(duty.Slot)
+				currentSlot, _ := m.beaconClient.GetCurrentSlot(m.config.BeaconNodeURL)
+				timeUntil := time.Duration((slot-currentSlot)*12) * time.Second
+
+				// Send notification for upcoming proposal
+				if timeUntil < 30*time.Minute && timeUntil > 0 {
+					alertKey := fmt.Sprintf("upcoming_proposal_%s_%s", duty.ValidatorIndex, duty.Slot)
+					if m.validatorManager.ShouldSendAlert(alertKey, 1440) {
+						message := fmt.Sprintf("📅 <b>Upcoming Proposal</b>\n"+
+							"Validator: %s\n"+
+							"Slot: %s\n"+
+							"Epoch: %d\n"+
+							"Time: %v",
+							duty.ValidatorIndex, duty.Slot, epoch, timeUntil)
+						m.notifier.Send(message, "upcoming_proposal")
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *Monitor) checkSyncCommitteeParticipation(currentEpoch int) error {
+	validatorIndexMap := make(map[string]bool)
+	for _, idx := range m.config.ValidatorIndices {
+		validatorIndexMap[strconv.Itoa(idx)] = true
+	}
+
+	for i := 0; i <= m.config.SyncCommitteeLookahead; i++ {
+		epoch := currentEpoch + i
+		syncCommittee, err := m.beaconClient.GetSyncCommittee(m.config.BeaconNodeURL, epoch)
+		if err != nil {
+			m.logger.Warn("Failed to get sync committee", "epoch", epoch, "error", err)
+			continue
+		}
+
+		for _, validatorIdx := range syncCommittee.Validators {
+			if validatorIndexMap[validatorIdx] {
+				// Send notification for sync committee participation
+				if epoch == currentEpoch {
+					alertKey := fmt.Sprintf("sync_committee_%s_%d", validatorIdx, epoch)
+					if m.validatorManager.ShouldSendAlert(alertKey, 1440) {
+						message := fmt.Sprintf("🔄 <b>Sync Committee</b>\n"+
+							"Validator: %s\n"+
+							"Epoch: %d\n"+
+							"Status: Active participant",
+							validatorIdx, epoch)
+						m.notifier.Send(message, "sync_committee")
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (m *Monitor) sendEpochSummary(epoch int) {
+	summary := m.validatorManager.GenerateEpochSummary(epoch)
+
+	activeValidators := 0
+	states := m.validatorManager.GetStates()
+	for _, state := range states {
+		if state.Status == "active_ongoing" {
+			activeValidators++
+		}
+	}
+
+	message := fmt.Sprintf("📊 <b>Epoch %d Summary</b>\n\n"+
+		"Active Validators: %d\n"+
+		"Successful Proposals: %d\n"+
+		"Missed Attestations: %d\n"+
+		"Total Rewards: %.6f ETH\n"+
+		"Performance: %.1f%%",
+		epoch,
+		activeValidators,
+		summary.SuccessfulProposals,
+		summary.MissedAttestations,
+		float64(summary.TotalRewards)/1e9,
+		func() float64 {
+			if activeValidators == 0 {
+				return 0
+			}
+			return float64(activeValidators-summary.MissedAttestations) / float64(activeValidators) * 100
+		}())
+
+	m.notifier.Send(message, "epoch_summary")
+}
+
+func (m *Monitor) handleTelegramCommand(text, username string) {
+	parts := strings.Fields(strings.ToLower(strings.TrimSpace(text)))
+	if len(parts) == 0 || !strings.HasPrefix(parts[0], "/") {
+		m.logger.Debug("Ignoring non-command message", "text", text, "user", username)
+		return
+	}
+
+	command := parts[0][1:] // Remove the "/"
+	m.logger.Info("Processing Telegram command",
+		"command", command,
+		"user", username,
+		"full_text", text,
+		"parts_count", len(parts))
+
+	var response string
+	var err error
+
+	switch command {
+	case "help":
+		response = m.getHelpMessage()
+		m.logger.Debug("Sending help message")
+
+	case "status":
+		response, err = m.getStatusMessage()
+		if err != nil {
+			response = "❌ Failed to get status: " + err.Error()
+			m.logger.Error("Failed to get status message", "error", err)
+		} else {
+			m.logger.Debug("Generated status message")
+		}
+
+	case "validator":
+		if len(parts) >= 2 {
+			if idx, parseErr := strconv.Atoi(parts[1]); parseErr == nil {
+				validators, validatorErr := m.beaconClient.GetValidatorStatuses(m.config.BeaconNodeURL, m.config.ValidatorIndices)
+				if validatorErr != nil {
+					response = "❌ Failed to get validator data: " + validatorErr.Error()
+				} else {
+					response = m.validatorManager.GetValidatorDetails(idx, validators)
+					if response == "" {
+						response = fmt.Sprintf("❌ Validator %d not found or not monitored", idx)
+						m.logger.Warn("Validator not found", "index", idx)
+					} else {
+						m.logger.Debug("Generated validator details", "index", idx)
+					}
+				}
+			} else {
+				response = "❌ Invalid validator index. Usage: /validator <number>"
+				m.logger.Warn("Invalid validator index provided", "input", parts[1])
+			}
+		} else {
+			response = "❌ Usage: /validator [index]\nExample: /validator 12345"
+			m.logger.Debug("Validator command missing index")
+		}
+
+	case "epoch":
+		var targetEpoch int
+		if len(parts) >= 2 {
+			if epochNum, parseErr := strconv.Atoi(parts[1]); parseErr == nil {
+				targetEpoch = epochNum
+			} else {
+				response = "❌ Invalid epoch number. Usage: /epoch <number>"
+				m.logger.Warn("Invalid epoch number provided", "input", parts[1])
+			}
+		} else {
+			// Default to last completed epoch
+			if currentSlot, epochErr := m.beaconClient.GetCurrentSlot(m.config.BeaconNodeURL); epochErr == nil {
+				targetEpoch = (currentSlot / 32) - 1
+			} else {
+				response = "❌ Failed to get current epoch"
+				m.logger.Error("Failed to get current epoch for default", "error", epochErr)
+			}
+		}
+
+		if response == "" { // No error yet
+			response = m.validatorManager.GetEpochSummaryMessage(targetEpoch)
+			if response == "" {
+				response = fmt.Sprintf("❌ No summary available for epoch %d", targetEpoch)
+				m.logger.Warn("No epoch summary available", "epoch", targetEpoch)
+			} else {
+				m.logger.Debug("Generated epoch summary", "epoch", targetEpoch)
+			}
+		}
+
+	default:
+		response = "❌ Unknown command: " + command + "\n\nType /help for available commands."
+		m.logger.Warn("Unknown command received", "command", command, "user", username)
+	}
+
+	// Send the response
+	if response != "" {
+		if sendErr := m.notifier.Send(response, "telegram_response"); sendErr != nil {
+			m.logger.Error("Failed to send Telegram response",
+				"command", command,
+				"user", username,
+				"error", sendErr,
+				"response_length", len(response))
+		} else {
+			m.logger.Info("Telegram command completed successfully",
+				"command", command,
+				"user", username,
+				"response_length", len(response))
+		}
+	}
+}
+
+func (m *Monitor) getHelpMessage() string {
+	return "🤖 <b>Validator Monitor Commands</b>\n\n" +
+		"/help - Show this help message\n" +
+		"/status - Show current system status\n" +
+		"/validator [index] - Show detailed validator info\n" +
+		"/epoch [number] - Show epoch summary (default: last epoch)\n\n" +
+		"<i>Monitor is running every " + strconv.Itoa(m.config.SlotCheckInterval) + " seconds for slot checks</i>"
+}
+
+func (m *Monitor) getStatusMessage() (string, error) {
+	nodes, err := m.checkAllNodes()
+	if err != nil {
+		return "", fmt.Errorf("failed to check nodes: %w", err)
+	}
+
+	epochInfo := "❌ Unknown"
+	currentEpoch := 0
+	if slot, err := m.beaconClient.GetCurrentSlot(m.config.BeaconNodeURL); err == nil {
+		currentEpoch = slot / 32
+		epochInfo = fmt.Sprintf("%d", currentEpoch)
+	}
+
+	validators, err := m.beaconClient.GetValidatorStatuses(m.config.BeaconNodeURL, m.config.ValidatorIndices)
+	activeCount := 0
+	if err == nil {
+		for _, validator := range validators {
+			if validator.Status == "active_ongoing" && !validator.Validator.Slashed {
+				activeCount++
+			}
+		}
+	}
+
+	var nodeStatuses []string
+	for _, node := range nodes {
+		status := "❌ Failed"
+		if node.Error == nil {
+			if node.Synced {
+				status = "✅ Synced"
+			} else {
+				status = "⏳ Syncing"
+			}
+		}
+		nodeStatuses = append(nodeStatuses, fmt.Sprintf("• %s: %s", node.Name, status))
+	}
+
+	message := fmt.Sprintf(
+		"📊 <b>Validator Monitor Status</b>\n\n"+
+			"<b>Node Status:</b>\n%s\n"+
+			"• Current Epoch: %s\n\n"+
+			"<b>Validators:</b>\n"+
+			"• Active: %d/%d\n"+
+			"• Check Interval: %ds (slots), %dm (full)",
+		strings.Join(nodeStatuses, "\n"),
+		epochInfo,
+		activeCount,
+		len(m.config.ValidatorIndices),
+		m.config.SlotCheckInterval,
+		m.config.CheckInterval)
+
+	return message, nil
+}
