@@ -1,5 +1,6 @@
 services:
   eth-sentry:
+    image: ghcr.io/benv666/ethsentry:latest
     build: .
     container_name: eth-sentry
     restart: unless-stopped
