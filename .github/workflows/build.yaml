@@ -1,6 +1,11 @@
 name: Build EthSentry
 
 on: [push, pull_request]
+
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   build:
     name: Build

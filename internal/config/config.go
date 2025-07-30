@@ -1,4 +1,4 @@
-// internal/config/config.go - Configuration management
+// internal/config/config.go - configuration management
 package config
 
 import (
@@ -10,21 +10,29 @@ import (
 )
 
 type Config struct {
-	BeaconNodeURL              string   `json:"beacon_node_url"`
-	ExecutionClientURL         string   `json:"execution_node_url"`
-	FallbackBeaconNodeURL      string   `json:"fallback_beacon_node_url"`
-	FallbackExecutionClientURL string   `json:"fallback_execution_node_url"`
-	TelegramBotToken           string   `json:"telegram_bot_token"`
-	TelegramChatID             string   `json:"telegram_chat_id"`
-	ValidatorIndices           []int    `json:"validator_indices"`
-	CheckInterval              int      `json:"check_interval_minutes"`
-	SlotCheckInterval          int      `json:"slot_check_interval_seconds"`
-	ProposalLookahead          int      `json:"proposal_lookahead_epochs"`
-	SyncCommitteeLookahead     int      `json:"sync_committee_lookahead_epochs"`
-	ShoutrrrURLs               []string `json:"shoutrrr_urls"`
-	EnablePrometheus           bool     `json:"enable_prometheus"`
-	PrometheusPort             int      `json:"prometheus_port"`
-	EpochSummaryEnabled        bool     `json:"epoch_summary_enabled"`
+	BeaconNodeURL              string `json:"beacon_node_url"`
+	ExecutionClientURL         string `json:"execution_node_url"`
+	FallbackBeaconNodeURL      string `json:"fallback_beacon_node_url"`
+	FallbackExecutionClientURL string `json:"fallback_execution_node_url"`
+	TelegramBotToken           string `json:"telegram_bot_token"`
+	TelegramChatID             string `json:"telegram_chat_id"`
+	ValidatorIndices           []int  `json:"validator_indices"`
+	CheckInterval              int    `json:"check_interval_minutes"`
+	SlotCheckInterval          int    `json:"slot_check_interval_seconds"`
+	ProposalLookahead          int    `json:"proposal_lookahead_epochs"`
+	SyncCommitteeLookahead     int    `json:"sync_committee_lookahead_epochs"`
+
+	// Enhanced notification configuration
+	ShoutrrrURLs         []string `json:"shoutrrr_urls"`
+	CriticalShoutrrrURLs []string `json:"critical_shoutrrr_urls"`
+
+	// Muting configuration
+	MuteRepeatingEvents   bool `json:"mute_repeating_events"`
+	StatusSummaryInterval int  `json:"status_summary_interval_hours"`
+
+	EnablePrometheus    bool `json:"enable_prometheus"`
+	PrometheusPort      int  `json:"prometheus_port"`
+	EpochSummaryEnabled bool `json:"epoch_summary_enabled"`
 }
 
 func Load() (Config, error) {
@@ -55,13 +63,25 @@ func Load() (Config, error) {
 	config.ProposalLookahead = getEnvInt("PROPOSAL_LOOKAHEAD", 1)
 	config.SyncCommitteeLookahead = getEnvInt("SYNC_COMMITTEE_LOOKAHEAD", 1)
 
-	// Parse Shoutrrr URLs
+	// Parse standard Shoutrrr URLs
 	if urls := os.Getenv("SHOUTRRR_URLS"); urls != "" {
 		config.ShoutrrrURLs = strings.Split(urls, ",")
 		for i := range config.ShoutrrrURLs {
 			config.ShoutrrrURLs[i] = strings.TrimSpace(config.ShoutrrrURLs[i])
 		}
 	}
+
+	// Parse critical Shoutrrr URLs
+	if urls := os.Getenv("CRITICAL_SHOUTRRR_URLS"); urls != "" {
+		config.CriticalShoutrrrURLs = strings.Split(urls, ",")
+		for i := range config.CriticalShoutrrrURLs {
+			config.CriticalShoutrrrURLs[i] = strings.TrimSpace(config.CriticalShoutrrrURLs[i])
+		}
+	}
+
+	// Muting and summary configuration
+	config.MuteRepeatingEvents = getEnvBool("MUTE_REPEATING_EVENTS", true)
+	config.StatusSummaryInterval = getEnvInt("STATUS_SUMMARY_INTERVAL", 6)
 
 	// Prometheus and feature settings
 	config.EnablePrometheus = getEnvBool("ENABLE_PROMETHEUS", false)

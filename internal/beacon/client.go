@@ -1,4 +1,4 @@
-// internal/beacon/client.go - Beacon chain API client
+// internal/beacon/client.go
 package beacon
 
 import (
@@ -55,6 +55,17 @@ type AttesterDuty struct {
 	Slot                    string `json:"slot"`
 }
 
+type AttesterDutiesRequest struct {
+	ValidatorIndices []string `json:"validator_indices"`
+}
+
+type AttesterDutiesResponse struct {
+	ExecutionOptimistic bool           `json:"execution_optimistic"`
+	Finalized           bool           `json:"finalized"`
+	Data                []AttesterDuty `json:"data"`
+	DependentRoot       string         `json:"dependent_root"`
+}
+
 type ProposerDuty struct {
 	Pubkey         string `json:"pubkey"`
 	ValidatorIndex string `json:"validator_index"`
@@ -106,7 +117,7 @@ type ExecutionSyncStatus struct {
 }
 
 func (c *Client) makeRequest(url string, result interface{}) error {
-	c.logger.Debug("Making HTTP request", "url", url)
+	c.logger.Debug("Making HTTP GET request", "url", url)
 
 	resp, err := c.httpClient.Get(url)
 	if err != nil {
@@ -125,6 +136,39 @@ func (c *Client) makeRequest(url string, result interface{}) error {
 	}
 
 	c.logger.Debug("HTTP response received", "status", resp.StatusCode, "body_length", len(body))
+
+	if err := json.Unmarshal(body, result); err != nil {
+		return fmt.Errorf("failed to parse JSON response: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Client) makePostRequest(url string, requestBody interface{}, result interface{}) error {
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	c.logger.Debug("Making HTTP POST request", "url", url, "body_length", len(jsonData))
+
+	resp, err := c.httpClient.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s - %s", resp.StatusCode, resp.Status, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	c.logger.Debug("HTTP POST response received", "status", resp.StatusCode, "body_length", len(body))
 
 	if err := json.Unmarshal(body, result); err != nil {
 		return fmt.Errorf("failed to parse JSON response: %w", err)
@@ -235,26 +279,41 @@ func (c *Client) GetValidatorStatuses(beaconURL string, validatorIndices []int) 
 	return response.Data, nil
 }
 
+// Fixed GetAttesterDuties - uses POST request as per correct API specification
 func (c *Client) GetAttesterDuties(beaconURL string, epoch int, validatorIndices []int) ([]AttesterDuty, error) {
 	if len(validatorIndices) == 0 {
 		return []AttesterDuty{}, nil
 	}
 
-	indices := make([]string, len(validatorIndices))
+	// Convert validator indices to strings for the request
+	stringIndices := make([]string, len(validatorIndices))
 	for i, idx := range validatorIndices {
-		indices[i] = strconv.Itoa(idx)
+		stringIndices[i] = strconv.Itoa(idx)
 	}
 
-	var response struct {
-		Data []AttesterDuty `json:"data"`
+	// Create the POST request body
+	requestBody := AttesterDutiesRequest{
+		ValidatorIndices: stringIndices,
 	}
-	url := fmt.Sprintf("%s/eth/v1/validator/duties/attester/%d?index=%s",
-		beaconURL, epoch, strings.Join(indices, ","))
 
-	err := c.makeRequest(url, &response)
+	var response AttesterDutiesResponse
+	url := fmt.Sprintf("%s/eth/v1/validator/duties/attester/%d", beaconURL, epoch)
+
+	c.logger.Debug("Requesting attester duties",
+		"epoch", epoch,
+		"validator_count", len(validatorIndices),
+		"url", url)
+
+	err := c.makePostRequest(url, requestBody, &response)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get attester duties for epoch %d: %w", epoch, err)
 	}
+
+	c.logger.Debug("Retrieved attester duties",
+		"epoch", epoch,
+		"duties_count", len(response.Data),
+		"execution_optimistic", response.ExecutionOptimistic,
+		"finalized", response.Finalized)
 
 	return response.Data, nil
 }
