@@ -1,4 +1,4 @@
-// internal/monitor/monitor.go
+// internal/monitor/monitor.go - Updated monitoring logic with proper duty management
 package monitor
 
 import (
@@ -12,6 +12,7 @@ import (
 	"eth-sentry/internal/attestation"
 	"eth-sentry/internal/beacon"
 	"eth-sentry/internal/config"
+	"eth-sentry/internal/duties"
 	"eth-sentry/internal/notifications"
 	"eth-sentry/internal/prometheus"
 	"eth-sentry/internal/types"
@@ -20,6 +21,7 @@ import (
 type Monitor struct {
 	config             *config.Config
 	beaconClient       *beacon.Client
+	dutyManager        *duties.Manager
 	attestationChecker *attestation.Checker
 	validatorManager   *ValidatorManager
 	notifier           *notifications.Notifier
@@ -32,13 +34,15 @@ type Monitor struct {
 
 func New(cfg *config.Config, notifier *notifications.Notifier, logger *slog.Logger) *Monitor {
 	beaconClient := beacon.NewClient(logger)
-	attestationChecker := attestation.NewChecker(beaconClient, logger)
+	dutyManager := duties.NewManager(beaconClient, logger)
+	attestationChecker := attestation.NewChecker(beaconClient, dutyManager, logger)
 	validatorManager := NewValidatorManager(cfg.ValidatorIndices, logger)
 	metrics := prometheus.New(cfg.EnablePrometheus, cfg.PrometheusPort)
 
 	return &Monitor{
 		config:             cfg,
 		beaconClient:       beaconClient,
+		dutyManager:        dutyManager,
 		attestationChecker: attestationChecker,
 		validatorManager:   validatorManager,
 		notifier:           notifier,
@@ -49,7 +53,7 @@ func New(cfg *config.Config, notifier *notifications.Notifier, logger *slog.Logg
 }
 
 func (m *Monitor) Start(ctx context.Context) {
-	m.logger.Info("Starting Enhanced Ethereum Validator Monitor",
+	m.logger.Info("Starting Enhanced Ethereum Validator Monitor with Proper Attestation Tracking",
 		"slot_check_interval", m.config.SlotCheckInterval,
 		"full_check_interval", m.config.CheckInterval,
 		"validator_count", len(m.config.ValidatorIndices),
@@ -63,6 +67,11 @@ func (m *Monitor) Start(ctx context.Context) {
 	if currentSlot, err := m.beaconClient.GetCurrentSlot(m.config.BeaconNodeURL); err == nil {
 		m.lastProcessedSlot = currentSlot - 1
 		m.lastProcessedEpoch = (currentSlot - 1) / 32
+
+		// Fetch duties for current and next epoch
+		currentEpoch := currentSlot / 32
+		m.fetchDutiesForEpoch(currentEpoch)
+		m.fetchDutiesForEpoch(currentEpoch + 1)
 	}
 
 	// Run initial startup check and send startup summary
@@ -92,6 +101,25 @@ func (m *Monitor) Start(ctx context.Context) {
 		case <-fullTicker.C:
 			m.runFullCheck()
 		}
+	}
+}
+
+func (m *Monitor) fetchDutiesForEpoch(epoch int) {
+	if len(m.config.ValidatorIndices) == 0 {
+		return
+	}
+
+	m.logger.Info("Fetching duties for epoch", "epoch", epoch, "validator_count", len(m.config.ValidatorIndices))
+
+	if err := m.dutyManager.FetchAndStoreDuties(m.config.BeaconNodeURL, epoch, m.config.ValidatorIndices); err != nil {
+		m.logger.Error("Failed to fetch duties for epoch", "epoch", epoch, "error", err)
+	} else {
+		validatorCount, slotCount, totalDuties := m.dutyManager.GetStats()
+		m.logger.Info("Successfully fetched and stored duties",
+			"epoch", epoch,
+			"validators_with_duties", validatorCount,
+			"slots_with_duties", slotCount,
+			"total_duties", totalDuties)
 	}
 }
 
@@ -132,6 +160,9 @@ func (m *Monitor) runStartupCheck() {
 	upcomingProposals := m.getUpcomingProposalsCount(currentEpoch)
 	upcomingSyncCommittee := m.getUpcomingSyncCommitteeCount(currentEpoch)
 
+	// Get duty statistics
+	validatorCount, slotCount, totalDuties := m.dutyManager.GetStats()
+
 	// Build node status summary
 	var nodeStatuses []string
 	primaryOK := true
@@ -164,6 +195,10 @@ func (m *Monitor) runStartupCheck() {
 		"<b>Validators:</b>\n"+
 		"• Active: %d/%d\n"+
 		"• Exiting: %d\n\n"+
+		"<b>Duties Loaded:</b>\n"+
+		"• Validators: %d\n"+
+		"• Slots: %d\n"+
+		"• Total: %d\n\n"+
 		"<b>Upcoming Duties:</b>\n"+
 		"• Proposals: %d\n"+
 		"• Sync Committee: %d\n\n"+
@@ -171,12 +206,13 @@ func (m *Monitor) runStartupCheck() {
 		"• Slot checks: %ds intervals\n"+
 		"• Full checks: %dm intervals\n"+
 		"• Muting: %v\n\n"+
-		"<i>Enhanced monitoring is now active!</i>",
+		"<i>Enhanced monitoring with proper attestation tracking is now active!</i>",
 		statusIcon,
 		strings.Join(nodeStatuses, "\n"),
 		epochInfo,
 		activeValidators, len(m.config.ValidatorIndices),
 		exitingValidators,
+		validatorCount, slotCount, totalDuties,
 		upcomingProposals,
 		upcomingSyncCommittee,
 		m.config.SlotCheckInterval,
@@ -208,10 +244,16 @@ func (m *Monitor) runSlotCheck() {
 
 	m.logger.Debug("Processing new slots", "current_slot", currentSlot, "last_processed", m.lastProcessedSlot)
 
-	// Check for block proposals in recent slots
+	// Process each new slot
 	for slot := m.lastProcessedSlot + 1; slot <= currentSlot; slot++ {
+		// Check for block proposals in this slot
 		if err := m.checkProposalPerformance(slot); err != nil {
 			m.logger.Debug("Error checking proposal performance", "slot", slot, "error", err)
+		}
+
+		// Check attestation inclusions in this slot (this is the key improvement!)
+		if m.startupComplete {
+			m.checkAttestationInclusionsInSlot(uint64(slot))
 		}
 	}
 
@@ -222,37 +264,68 @@ func (m *Monitor) runSlotCheck() {
 	if currentEpoch > m.lastProcessedEpoch {
 		m.logger.Info("New epoch detected", "epoch", currentEpoch, "slot", currentSlot)
 
-		// Check attestation performance for the completed epoch (only after startup)
+		// Fetch duties for the new epoch ahead
+		lookAheadEpoch := currentEpoch + 1
+		m.fetchDutiesForEpoch(lookAheadEpoch)
+
+		// Check for missed attestations from previous epochs (after startup)
 		if m.lastProcessedEpoch > 0 && m.startupComplete {
-			if results, err := m.attestationChecker.CheckEpochAttestations(
-				m.config.BeaconNodeURL, m.lastProcessedEpoch, m.config.ValidatorIndices); err != nil {
-				m.logger.Error("Failed to check attestation performance", "epoch", m.lastProcessedEpoch, "error", err)
-			} else {
-				m.validatorManager.UpdateAttestationResults(results)
+			m.checkMissedAttestations(uint64(currentSlot))
+		}
 
-				// Update metrics and send alerts for missed attestations
-				for _, result := range results {
-					m.metrics.UpdateAttestation(result.ValidatorIndex, result.Attested)
+		// Clean up old duties to prevent memory leak
+		m.dutyManager.CleanupOldDuties(uint64(currentEpoch))
 
-					if !result.Attested {
-						alertKey := fmt.Sprintf("missed_attestation_%d_%d", result.ValidatorIndex, result.Epoch)
-						message := fmt.Sprintf("⚠️ <b>Missed Attestation</b>\nValidator: %d\nEpoch: %d\nSlot: %d",
-							result.ValidatorIndex, result.Epoch, result.Slot)
-
-						// Missed attestations are critical
-						m.notifier.SendCritical(message, alertKey)
-					}
-				}
-			}
-
-			// Send epoch summary if enabled (but allow muting)
-			if m.config.EpochSummaryEnabled {
-				m.sendEpochSummary(m.lastProcessedEpoch)
-			}
+		// Send epoch summary if enabled (but allow muting)
+		if m.config.EpochSummaryEnabled && m.startupComplete {
+			m.sendEpochSummary(m.lastProcessedEpoch)
 		}
 
 		m.lastProcessedEpoch = currentEpoch
 		m.metrics.UpdateCurrentEpoch(currentEpoch)
+	}
+}
+
+func (m *Monitor) checkAttestationInclusionsInSlot(blockSlot uint64) {
+	// This is the core of proper attestation checking!
+	results, err := m.attestationChecker.CheckAttestationInclusion(m.config.BeaconNodeURL, blockSlot)
+	if err != nil {
+		m.logger.Debug("Error checking attestation inclusions", "slot", blockSlot, "error", err)
+		return
+	}
+
+	if len(results) > 0 {
+		m.logger.Info("Found attestation inclusions", "slot", blockSlot, "inclusions", len(results))
+
+		// Update metrics and validator manager
+		for _, result := range results {
+			m.metrics.UpdateAttestation(result.ValidatorIndex, result.Attested)
+			// Note: We don't send individual inclusion notifications as they would be spam
+			// The important thing is that we're tracking them correctly
+		}
+	}
+}
+
+func (m *Monitor) checkMissedAttestations(currentSlot uint64) {
+	// Check for missed attestations with a reasonable lookback
+	lookbackSlots := uint64(64) // About 2 epochs worth of slots
+
+	missedAttestations := m.attestationChecker.GetMissedAttestations(currentSlot, lookbackSlots)
+
+	if len(missedAttestations) > 0 {
+		m.logger.Warn("Found missed attestations", "count", len(missedAttestations))
+
+		// Send notifications for missed attestations
+		for _, missed := range missedAttestations {
+			m.metrics.UpdateAttestation(missed.ValidatorIndex, false)
+
+			alertKey := fmt.Sprintf("missed_attestation_%d_%d", missed.ValidatorIndex, missed.Epoch)
+			message := fmt.Sprintf("⚠️ <b>Missed Attestation</b>\nValidator: %d\nEpoch: %d\nSlot: %d",
+				missed.ValidatorIndex, missed.Epoch, missed.Slot)
+
+			// Missed attestations are critical
+			m.notifier.SendCritical(message, alertKey)
+		}
 	}
 }
 
@@ -348,14 +421,22 @@ func (m *Monitor) runFullCheck() {
 
 	// Send periodic status summary (with muting support)
 	if m.validatorManager.ShouldSendAlert("status_summary", m.config.StatusSummaryInterval*60) {
+		validatorCount, slotCount, totalDuties := m.dutyManager.GetStats()
+
 		message := fmt.Sprintf(
 			"✅ <b>Validator Status Summary</b>\n"+
 				"Epoch: %d\n"+
 				"Active Validators: %d/%d\n"+
+				"Duties ValidatorCount: %d\n"+
+				"Duties slotCount: %d\n"+
+				"Duties Tracked: %d\n"+
 				"Nodes: All operational",
 			currentEpoch,
 			activeCount,
-			len(m.config.ValidatorIndices))
+			len(m.config.ValidatorIndices),
+			validatorCount,
+			slotCount,
+			totalDuties)
 		m.notifier.Send(message, "status_summary")
 	}
 
@@ -646,6 +727,10 @@ func (m *Monitor) handleTelegramCommand(text, username string) {
 			m.logger.Debug("Generated status message")
 		}
 
+	case "duties":
+		response = m.getDutiesMessage()
+		m.logger.Debug("Generated duties message")
+
 	case "validator":
 		if len(parts) >= 2 {
 			if idx, parseErr := strconv.Atoi(parts[1]); parseErr == nil {
@@ -658,6 +743,9 @@ func (m *Monitor) handleTelegramCommand(text, username string) {
 						response = fmt.Sprintf("❌ Validator %d not found or not monitored", idx)
 						m.logger.Warn("Validator not found", "index", idx)
 					} else {
+						// Add duty information
+						duties := m.dutyManager.GetValidatorDuties(uint64(idx))
+						response += fmt.Sprintf("\n\n<b>Recent Duties:</b> %d tracked", len(duties))
 						m.logger.Debug("Generated validator details", "index", idx)
 					}
 				}
@@ -722,12 +810,37 @@ func (m *Monitor) handleTelegramCommand(text, username string) {
 }
 
 func (m *Monitor) getHelpMessage() string {
-	return "🤖 <b>Validator Monitor Commands</b>\n\n" +
+	return "🤖 <b>Enhanced Validator Monitor Commands</b>\n\n" +
 		"/help - Show this help message\n" +
 		"/status - Show current system status\n" +
+		"/duties - Show duty tracking statistics\n" +
 		"/validator [index] - Show detailed validator info\n" +
 		"/epoch [number] - Show epoch summary (default: last epoch)\n\n" +
-		"<i>Monitor is running every " + strconv.Itoa(m.config.SlotCheckInterval) + " seconds for slot checks</i>"
+		"<i>Monitor is running every " + strconv.Itoa(m.config.SlotCheckInterval) + " seconds for slot checks with proper attestation tracking</i>"
+}
+
+func (m *Monitor) getDutiesMessage() string {
+	validatorCount, slotCount, totalDuties := m.dutyManager.GetStats()
+
+	currentSlot, err := m.beaconClient.GetCurrentSlot(m.config.BeaconNodeURL)
+	currentEpochInfo := "Unknown"
+	if err == nil {
+		currentEpoch := currentSlot / 32
+		currentEpochInfo = fmt.Sprintf("%d", currentEpoch)
+	}
+
+	message := fmt.Sprintf("📋 <b>Duty Tracking Statistics</b>\n\n"+
+		"<b>Current Epoch:</b> %s\n"+
+		"<b>Validators with Duties:</b> %d\n"+
+		"<b>Slots with Duties:</b> %d\n"+
+		"<b>Total Duties Tracked:</b> %d\n\n"+
+		"<i>Duties are automatically fetched for current and upcoming epochs</i>",
+		currentEpochInfo,
+		validatorCount,
+		slotCount,
+		totalDuties)
+
+	return message
 }
 
 func (m *Monitor) getStatusMessage() (string, error) {
@@ -766,21 +879,30 @@ func (m *Monitor) getStatusMessage() (string, error) {
 		nodeStatuses = append(nodeStatuses, fmt.Sprintf("• %s: %s", node.Name, status))
 	}
 
+	validatorCount, slotCount, totalDuties := m.dutyManager.GetStats()
+
 	message := fmt.Sprintf(
-		"📊 <b>Validator Monitor Status</b>\n\n"+
+		"📊 <b>Enhanced Validator Monitor Status</b>\n\n"+
 			"<b>Node Status:</b>\n%s\n"+
 			"• Current Epoch: %s\n\n"+
 			"<b>Validators:</b>\n"+
 			"• Active: %d/%d\n"+
 			"• Check Interval: %ds (slots), %dm (full)\n"+
-			"• Muting: %v",
+			"• Muting: %v\n\n"+
+			"<b>Duty Tracking:</b>\n"+
+			"• Validators: %d\n"+
+			"• Slots: %d\n"+
+			"• Total: %d",
 		strings.Join(nodeStatuses, "\n"),
 		epochInfo,
 		activeCount,
 		len(m.config.ValidatorIndices),
 		m.config.SlotCheckInterval,
 		m.config.CheckInterval,
-		m.config.MuteRepeatingEvents)
+		m.config.MuteRepeatingEvents,
+		validatorCount,
+		slotCount,
+		totalDuties)
 
 	return message, nil
 }

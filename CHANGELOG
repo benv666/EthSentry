@@ -13,3 +13,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fallback nodes
 - Shoutrrr support (e.g. pushover, webhooks, discord, ..)
 - Telegram commands (help, status, validator, epoch)
+- Educated Claude.ai about attestation bits - this seems like a hard thing for AI to get right
