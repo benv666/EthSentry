@@ -76,7 +76,7 @@ type Attestation struct {
 	AggregationBits string `json:"aggregation_bits"`
 	Data            struct {
 		Slot            string `json:"slot"`
-		CommitteeIndex  string `json:"committee_index"`
+		Index           string `json:"index"`
 		BeaconBlockRoot string `json:"beacon_block_root"`
 		Source          struct {
 			Epoch string `json:"epoch"`

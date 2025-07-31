@@ -56,12 +56,12 @@ func (c *Checker) CheckAttestationInclusion(beaconURL string, blockSlot uint64) 
 			continue
 		}
 
-		attestedCommitteeIndex, err := strconv.ParseUint(attestation.Data.CommitteeIndex, 10, 64)
+		attestedCommitteeIndex, err := strconv.ParseUint(attestation.Data.Index, 10, 64)
 		if err != nil {
 			c.logger.Warn("Invalid committee index in attestation",
 				"block_slot", blockSlot,
 				"attestation_idx", attestationIdx,
-				"committee_index_string", attestation.Data.CommitteeIndex,
+				"committee_index_string", attestation.Data.Index,
 				"error", err)
 			continue
 		}
