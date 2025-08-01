@@ -80,10 +80,20 @@ func (c *Checker) CheckAttestationInclusion(beaconURL string, blockSlot uint64) 
 			"attested_slot", attestedSlot,
 			"duty_count", len(slotDuties))
 
+		// Log all duties for debugging
+		for _, duty := range slotDuties {
+			c.logger.Debug("Available duty",
+				"validator", duty.Validator,
+				"committee_index", duty.CommitteeIndex,
+				"validator_committee_index", duty.ValidatorCommitteeIndex,
+				"type", duty.Type)
+		}
+
 		// Check each duty for this slot
 		for _, duty := range slotDuties {
 			// Only process attestation duties that match this attestation's committee
 			if duty.Type != duties.DutyTypeAttestation {
+				c.logger.Debug("Duty type mismatch iterating on slotDuties, ignoring for attestation check", "type", duty.Type, "duty", duty.String())
 				continue
 			}
 

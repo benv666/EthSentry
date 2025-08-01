@@ -74,6 +74,13 @@ func (m *Monitor) Start(ctx context.Context) {
 		m.fetchDutiesForEpoch(currentEpoch + 1)
 	}
 
+	// Log duty stats after fetching
+	validatorCount, slotCount, totalDuties := m.dutyManager.GetStats()
+	m.logger.Info("Startup duties loaded",
+		"validators_with_duties", validatorCount,
+		"slots_with_duties", slotCount,
+		"total_duties", totalDuties)
+
 	// Run initial startup check and send startup summary
 	m.runStartupCheck()
 
@@ -156,6 +163,20 @@ func (m *Monitor) runStartupCheck() {
 		}
 	}
 
+	// Format validator indices for display
+	validatorList := ""
+	if len(m.config.ValidatorIndices) > 0 {
+		indices := make([]string, len(m.config.ValidatorIndices))
+		for i, idx := range m.config.ValidatorIndices {
+			indices[i] = strconv.Itoa(idx)
+		}
+		if len(indices) <= 10 {
+			validatorList = strings.Join(indices, ", ")
+		} else {
+			validatorList = strings.Join(indices[:10], ", ") + fmt.Sprintf(" (+%d more)", len(indices)-10)
+		}
+	}
+
 	// Check upcoming duties
 	upcomingProposals := m.getUpcomingProposalsCount(currentEpoch)
 	upcomingSyncCommittee := m.getUpcomingSyncCommitteeCount(currentEpoch)
@@ -192,7 +213,9 @@ func (m *Monitor) runStartupCheck() {
 	message := fmt.Sprintf("%s <b>Validator Monitor Started</b>\n\n"+
 		"<b>System Status:</b>\n%s\n"+
 		"• Current Epoch: %s\n\n"+
-		"<b>Validators:</b>\n"+
+		"<b>Monitored Validators:</b>\n"+
+		"• Count: %d\n"+
+		"• Indices: %s\n"+
 		"• Active: %d/%d\n"+
 		"• Exiting: %d\n\n"+
 		"<b>Duties Loaded:</b>\n"+
@@ -210,6 +233,8 @@ func (m *Monitor) runStartupCheck() {
 		statusIcon,
 		strings.Join(nodeStatuses, "\n"),
 		epochInfo,
+		len(m.config.ValidatorIndices),
+		validatorList,
 		activeValidators, len(m.config.ValidatorIndices),
 		exitingValidators,
 		validatorCount, slotCount, totalDuties,
@@ -754,8 +779,19 @@ func (m *Monitor) handleTelegramCommand(text, username string) {
 				m.logger.Warn("Invalid validator index provided", "input", parts[1])
 			}
 		} else {
-			response = "❌ Usage: /validator [index]\nExample: /validator 12345"
-			m.logger.Debug("Validator command missing index")
+			// Show list of monitored validators
+			indices := make([]string, len(m.config.ValidatorIndices))
+			for i, idx := range m.config.ValidatorIndices {
+				indices[i] = strconv.Itoa(idx)
+			}
+
+			if len(indices) == 0 {
+				response = "❌ No validators are being monitored"
+			} else {
+				response = fmt.Sprintf("📋 <b>Monitored Validators (%d)</b>\n\n<code>%s</code>\n\n<i>Use /validator [index] to see details</i>",
+					len(indices), strings.Join(indices, ", "))
+			}
+			m.logger.Debug("Generated validator list")
 		}
 
 	case "epoch":

@@ -137,37 +137,6 @@ func (vm *ValidatorManager) UpdateProposal(validatorIndex, slot int, reward int6
 	}
 }
 
-func (vm *ValidatorManager) GenerateEpochSummary(epoch int) *types.EpochSummary {
-	summary := &types.EpochSummary{
-		Epoch:                epoch,
-		ValidatorPerformance: make(map[int]*types.ValidatorPerformance),
-	}
-
-	for validatorIdx, state := range vm.states {
-		perf := &types.ValidatorPerformance{
-			Index:              validatorIdx,
-			AttestationSuccess: state.EpochAttestations[epoch],
-			ProposalSuccess:    state.EpochProposals[epoch],
-			ProposalReward:     state.LastProposalReward,
-		}
-
-		if !perf.AttestationSuccess {
-			perf.MissedAttestation = true
-			summary.MissedAttestations++
-		}
-
-		if perf.ProposalSuccess {
-			summary.SuccessfulProposals++
-			summary.TotalRewards += perf.ProposalReward
-		}
-
-		summary.ValidatorPerformance[validatorIdx] = perf
-	}
-
-	vm.summaries[epoch] = summary
-	return summary
-}
-
 func (vm *ValidatorManager) GetValidatorDetails(index int, validators []beacon.ValidatorData) string {
 	state, exists := vm.states[index]
 	if !exists {
@@ -228,7 +197,12 @@ func (vm *ValidatorManager) GetValidatorDetails(index int, validators []beacon.V
 func (vm *ValidatorManager) GetEpochSummaryMessage(epoch int) string {
 	summary, exists := vm.summaries[epoch]
 	if !exists {
-		return ""
+		// Try to generate one if we have any data
+		vm.logger.Debug("Summary not found, attempting to generate", "epoch", epoch)
+		summary = vm.GenerateEpochSummary(epoch)
+		if len(summary.ValidatorPerformance) == 0 {
+			return fmt.Sprintf("❌ No data available for epoch %d\n\n<i>Summaries are generated as epochs complete and validators have tracked duties</i>", epoch)
+		}
 	}
 
 	var performanceDetails []string
@@ -245,20 +219,84 @@ func (vm *ValidatorManager) GetEpochSummaryMessage(epoch int) string {
 
 	sort.Strings(performanceDetails)
 
+	totalValidators := len(summary.ValidatorPerformance)
+	successfulAttestations := totalValidators - summary.MissedAttestations
+	performanceRate := 0.0
+	if totalValidators > 0 {
+		performanceRate = float64(successfulAttestations) / float64(totalValidators) * 100
+	}
+
 	message := fmt.Sprintf("📊 <b>Epoch %d Summary</b>\n\n"+
 		"<b>Overview:</b>\n"+
-		"• Successful Proposals: %d\n"+
+		"• Validators: %d\n"+
+		"• Successful Attestations: %d/%d (%.1f%%)\n"+
 		"• Missed Attestations: %d\n"+
+		"• Successful Proposals: %d\n"+
 		"• Total Rewards: %.6f ETH\n\n"+
 		"<b>Validator Performance:</b>\n%s\n\n"+
 		"<i>✅ = Attested, ❌ = Missed, 🎯 = Proposed</i>",
 		epoch,
-		summary.SuccessfulProposals,
+		totalValidators,
+		successfulAttestations, totalValidators, performanceRate,
 		summary.MissedAttestations,
+		summary.SuccessfulProposals,
 		float64(summary.TotalRewards)/1e9,
 		strings.Join(performanceDetails, "\n"))
 
 	return message
+}
+
+func (vm *ValidatorManager) GenerateEpochSummary(epoch int) *types.EpochSummary {
+	summary := &types.EpochSummary{
+		Epoch:                epoch,
+		ValidatorPerformance: make(map[int]*types.ValidatorPerformance),
+	}
+
+	vm.logger.Info("Generating epoch summary", "epoch", epoch, "validator_count", len(vm.states))
+
+	for validatorIdx, state := range vm.states {
+		perf := &types.ValidatorPerformance{
+			Index:              validatorIdx,
+			AttestationSuccess: state.EpochAttestations[epoch],
+			ProposalSuccess:    state.EpochProposals[epoch],
+			ProposalReward:     0, // Initialize to 0
+		}
+
+		// Only set proposal reward if there was a successful proposal
+		if perf.ProposalSuccess {
+			perf.ProposalReward = state.LastProposalReward
+		}
+
+		if !perf.AttestationSuccess {
+			perf.MissedAttestation = true
+			summary.MissedAttestations++
+		}
+
+		if perf.ProposalSuccess {
+			summary.SuccessfulProposals++
+			summary.TotalRewards += perf.ProposalReward
+		}
+
+		summary.ValidatorPerformance[validatorIdx] = perf
+		
+		vm.logger.Debug("Added validator to epoch summary",
+			"validator", validatorIdx,
+			"epoch", epoch,
+			"attestation_success", perf.AttestationSuccess,
+			"proposal_success", perf.ProposalSuccess,
+			"missed_attestation", perf.MissedAttestation)
+	}
+
+	// Store the summary - THIS WAS MISSING!
+	vm.summaries[epoch] = summary
+	
+	vm.logger.Info("Epoch summary generated",
+		"epoch", epoch,
+		"validators", len(summary.ValidatorPerformance),
+		"missed_attestations", summary.MissedAttestations,
+		"successful_proposals", summary.SuccessfulProposals)
+
+	return summary
 }
 
 func (vm *ValidatorManager) ShouldSendAlert(alertKey string, cooldownMinutes int) bool {
