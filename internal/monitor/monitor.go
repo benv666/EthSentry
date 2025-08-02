@@ -229,7 +229,7 @@ func (m *Monitor) runStartupCheck() {
 		"• Slot checks: %ds intervals\n"+
 		"• Full checks: %dm intervals\n"+
 		"• Muting: %v\n\n"+
-		"<i>Enhanced monitoring with proper attestation tracking is now active!</i>",
+		"<i>Monitoring is now active!</i>",
 		statusIcon,
 		strings.Join(nodeStatuses, "\n"),
 		epochInfo,
@@ -294,7 +294,7 @@ func (m *Monitor) runSlotCheck() {
 		m.fetchDutiesForEpoch(lookAheadEpoch)
 
 		// Check for missed attestations from previous epochs (after startup)
-		if m.lastProcessedEpoch > 0 && m.startupComplete {
+		if m.lastProcessedEpoch > 0 && m.startupComplete && m.config.AttestationCheckerEnabled {
 			m.checkMissedAttestations(uint64(currentSlot))
 		}
 
@@ -333,7 +333,7 @@ func (m *Monitor) checkAttestationInclusionsInSlot(blockSlot uint64) {
 
 func (m *Monitor) checkMissedAttestations(currentSlot uint64) {
 	// Check for missed attestations with a reasonable lookback
-	lookbackSlots := uint64(64) // About 2 epochs worth of slots
+	lookbackSlots := uint64(64) // 2 epochs worth of slots
 
 	missedAttestations := m.attestationChecker.GetMissedAttestations(currentSlot, lookbackSlots)
 
@@ -771,6 +771,7 @@ func (m *Monitor) handleTelegramCommand(text, username string) {
 						// Add duty information
 						duties := m.dutyManager.GetValidatorDuties(uint64(idx))
 						response += fmt.Sprintf("\n\n<b>Recent Duties:</b> %d tracked", len(duties))
+						response += fmt.Sprintf("\n\n<b>Duty details:</b> %s ", duties[0])
 						m.logger.Debug("Generated validator details", "index", idx)
 					}
 				}
@@ -790,6 +791,7 @@ func (m *Monitor) handleTelegramCommand(text, username string) {
 			} else {
 				response = fmt.Sprintf("📋 <b>Monitored Validators (%d)</b>\n\n<code>%s</code>\n\n<i>Use /validator [index] to see details</i>",
 					len(indices), strings.Join(indices, ", "))
+				response += fmt.Sprintf("\nE.g.: <code>/validator %s</code>", indices[0])
 			}
 			m.logger.Debug("Generated validator list")
 		}
@@ -852,7 +854,7 @@ func (m *Monitor) getHelpMessage() string {
 		"/duties - Show duty tracking statistics\n" +
 		"/validator [index] - Show detailed validator info\n" +
 		"/epoch [number] - Show epoch summary (default: last epoch)\n\n" +
-		"<i>Monitor is running every " + strconv.Itoa(m.config.SlotCheckInterval) + " seconds for slot checks with proper attestation tracking</i>"
+		"<i>Monitor is running every " + strconv.Itoa(m.config.SlotCheckInterval) + " seconds for slot checks</i>"
 }
 
 func (m *Monitor) getDutiesMessage() string {

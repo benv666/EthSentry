@@ -55,10 +55,6 @@ type AttesterDuty struct {
 	Slot                    string `json:"slot"`
 }
 
-type AttesterDutiesRequest struct {
-	ValidatorIndices []string `json:"validator_indices"`
-}
-
 type AttesterDutiesResponse struct {
 	ExecutionOptimistic bool           `json:"execution_optimistic"`
 	Finalized           bool           `json:"finalized"`
@@ -88,6 +84,7 @@ type Attestation struct {
 		} `json:"target"`
 	} `json:"data"`
 	Signature string `json:"signature"`
+	CommitteeBits string `json:"committee_bits"`
 }
 
 type BlockResponse struct {
@@ -96,11 +93,13 @@ type BlockResponse struct {
 			Slot          string `json:"slot"`
 			ProposerIndex string `json:"proposer_index"`
 			Body          struct {
+				Graffiti     string `json:"graffiti"` // Validator graffiti
 				Attestations     []Attestation `json:"attestations"`
 				ExecutionPayload struct {
 					BlockNumber string `json:"block_number"`
 					GasUsed     string `json:"gas_used"`
 					GasLimit    string `json:"gas_limit"`
+					ExtraData   string `json:"extra_data"` // "BuilderNet (Flashbots)" and such texts here
 				} `json:"execution_payload"`
 			} `json:"body"`
 		} `json:"message"`
@@ -292,9 +291,7 @@ func (c *Client) GetAttesterDuties(beaconURL string, epoch int, validatorIndices
 	}
 
 	// Create the POST request body
-	requestBody := AttesterDutiesRequest{
-		ValidatorIndices: stringIndices,
-	}
+	requestBody := stringIndices
 
 	var response AttesterDutiesResponse
 	url := fmt.Sprintf("%s/eth/v1/validator/duties/attester/%d", beaconURL, epoch)

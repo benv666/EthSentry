@@ -210,7 +210,7 @@ func (c *Checker) GetMissedAttestations(currentSlot uint64, lookbackSlots uint64
 
 	// Check slots from lookbackSlots ago up to a reasonable cutoff
 	// We don't check the most recent slots as attestations might still be incoming
-	cutoffSlot := currentSlot - 6 // Don't check last 6 slots (about 1 minute)
+	cutoffSlot := currentSlot - 32 // Don't check newest 32 slots, they'll come up next round
 	startSlot := currentSlot - lookbackSlots
 
 	c.logger.Debug("Checking for missed attestations",
@@ -219,11 +219,10 @@ func (c *Checker) GetMissedAttestations(currentSlot uint64, lookbackSlots uint64
 		"cutoff_slot", cutoffSlot)
 
 	for slot := startSlot; slot <= cutoffSlot; slot++ {
-		duties := c.dutyManager.GetSlotDuties(slot)
+		slotDuties := c.dutyManager.GetSlotDuties(slot)
 
-		for _, duty := range duties {
-			// if duty.Type != duties.DutyTypeAttestation { // TODO, fix this, it doesn't like it.
-			if duty.Type != "attestation" {
+		for _, duty := range slotDuties {
+			if duty.Type != duties.DutyTypeAttestation {
 				continue
 			}
 

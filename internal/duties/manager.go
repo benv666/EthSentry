@@ -120,7 +120,7 @@ func (m *Manager) FetchAndStoreDuties(beaconURL string, epoch int, validatorIndi
 			"epoch", epoch,
 			"committee_index", committeeIndex,
 			"validator_committee_index", validatorCommitteeIndex,
-			"pubkey_prefix", dutyData.Pubkey[:12])
+			"pubkey", dutyData.Pubkey)
 	}
 
 	m.logger.Info("Stored attester duties", "epoch", epoch, "stored_count", len(duties))

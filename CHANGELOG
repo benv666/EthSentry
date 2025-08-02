@@ -14,3 +14,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shoutrrr support (e.g. pushover, webhooks, discord, ..)
 - Telegram commands (help, status, validator, epoch)
 - Educated Claude.ai about attestation bits - this seems like a hard thing for AI to get right
+- Initial missed attestation monitoring, flakey though, all AI seems to suck at this. Added toggle to turn it off.

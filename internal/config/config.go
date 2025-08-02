@@ -33,6 +33,7 @@ type Config struct {
 	EnablePrometheus    bool `json:"enable_prometheus"`
 	PrometheusPort      int  `json:"prometheus_port"`
 	EpochSummaryEnabled bool `json:"epoch_summary_enabled"`
+	AttestationCheckerEnabled bool `json:"attestation_checker_enabled"`
 }
 
 func Load() (Config, error) {
@@ -87,6 +88,7 @@ func Load() (Config, error) {
 	config.EnablePrometheus = getEnvBool("ENABLE_PROMETHEUS", false)
 	config.PrometheusPort = getEnvInt("PROMETHEUS_PORT", 8080)
 	config.EpochSummaryEnabled = getEnvBool("EPOCH_SUMMARY_ENABLED", true)
+	config.AttestationCheckerEnabled = getEnvBool("ATTESTATION_CHECKER_ENABLED", true)
 
 	// Sort validator indices for consistent ordering
 	sort.Ints(config.ValidatorIndices)
